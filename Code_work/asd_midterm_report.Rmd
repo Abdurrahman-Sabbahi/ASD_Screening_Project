@@ -1,0 +1,464 @@
+---
+title: "ASD Risk Screening: Comparative Evaluation of Statistical Learning Methods"
+subtitle: "ISyE 7406 -- Data Mining & Statistical Learning | Midterm Report"
+author: "Abdurrahman Sabbahi | asabbahi3@gatech.edu | Group 20"
+date: "July 2026"
+header-includes:
+  - \usepackage{float}
+  - \usepackage{needspace}
+  - \usepackage{caption}
+  - \widowpenalty=10000
+  - \clubpenalty=10000
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE,
+                      fig.align="center", fig.width=9, fig.height=5,
+                      out.width="80%", fig.pos="H")
+```
+
+```{r run-script, include=FALSE}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(e1071)
+library(MASS)
+library(pROC)
+library(corrplot)
+library(glmnet)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+
+select <- dplyr::select
+filter <- dplyr::filter
+set.seed(42)
+
+source("asd_analysis.R", local = TRUE)
+```
+
+---
+
+# Introduction
+
+Autism Spectrum Disorder (ASD) affects roughly 1 in 36 children in the United States, yet the average time from parental concern to a confirmed diagnosis can stretch across years. Going through that process with my son, filling in questionnaires and not fully understanding what the numbers meant or how different symptoms contribute to Autism, motivated the research question: *how much predictive information actually sits in those ten screening responses?*
+
+The [AQ-10](https://docs.autismresearchcentre.com/tests/AQ10.pdf) is a ten-item behavioral questionnaire used as a first-pass screener for ASD across three developmental stages. This report compares five classifiers on separate Child, Adolescent, and Adult datasets, as well as the three combined, asking four questions: (1) which model performs best overall, (2) whether performance varies meaningfully by age group, (3) which features carry the most predictive signal, and (4) whether the ten AQ items alone are sufficient or whether demographic variables add value.
+
+---
+
+# Problem Statement
+
+Clinical ASD diagnosis is time-consuming, expensive, and typically requires specialist assessment. Screening tools like the AQ-10 exist to identify individuals at elevated risk before a full diagnostic workup, but the statistical properties of the screener across different age groups are not well characterised. Specifically:
+
+- Does a simple linear classifier trained on AQ-10 item responses perform as well as more complex models, or is there meaningful non-linearity in how the items predict ASD status?
+- Does performance generalise consistently across age groups (children, adolescents, adults), or do certain models degrade for specific groups?
+- Do demographic variables (age, gender, jaundice history, family ASD history) add predictive value beyond the ten item scores, or are the items themselves sufficient?
+
+Answering these questions has practical implications. If a logistic regression on ten items achieves near-ceiling AUC, it implies the clinical threshold already embedded in the screener captures most of the signal. If demographics add nothing, the screener is robust to demographic variation and less prone to bias. If performance degrades sharply in adolescents, that signals a data gap worth addressing with more targeted data collection.
+
+---
+
+# Data Sources
+
+## Source
+
+Three datasets from Fadi Fayez Thabtah (UCI / Kaggle), one per developmental stage, all collected with the same AQ-10 screening protocol. Each row corresponds to one individual who completed the screener.
+
+## Overview
+
+\Needspace{6\baselineskip}
+
+```{r dataset-overview}
+tibble(
+  Group       = c("Child","Adolescent","Adult","**Combined**"),
+  `Age range` = c("4--11","12--16","17+","--"),
+  N           = c(nrow(child), nrow(teen), nrow(adult), nrow(comb)),
+  `ASD+ (%)`  = c(round(mean(child$ASD=="YES")*100,1),
+                  round(mean(teen$ASD =="YES")*100,1),
+                  round(mean(adult$ASD=="YES")*100,1),
+                  round(mean(comb$ASD =="YES")*100,1))
+) %>%
+  kable(caption="Dataset summary by age group.", align="lccc", booktabs=TRUE) %>%
+  kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover"),
+                latex_options=c("hold_position"))
+```
+
+## Descriptive Statistics
+
+\Needspace{8\baselineskip}
+
+```{r desc-table}
+kable(desc, caption="Descriptive statistics (full dataset, before the train/test split).",
+      align="lcccccc", booktabs=TRUE) %>%
+  kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover"),
+                latex_options=c("hold_position","scale_down"), font_size=8) %>%
+  row_spec(4, bold=TRUE)
+```
+
+The adult dataset (n = `r nrow(adult)`) is the largest and most imbalanced, only `r round(mean(adult$ASD=="YES")*100,0)`% ASD positive. The adolescent set (n = `r nrow(teen)`) is the smallest and those results should be interpreted with extra caution. The AQ mean is consistently higher in positive cases across all groups, which is an early sign of predictive signal.
+
+## Preprocessing
+
+Raw missing values (`"?"` and blank strings) were replaced with `NA` on import. Age was the only column with missingness (three observations); these were imputed using the group-specific median computed from the training set only, the test set median was never consulted. The `result` column (raw AQ sum) and any ID columns were dropped immediately, since keeping them would give the models the answer directly.
+
+Binary variables (gender, jaundice history, family ASD history, prior app use) were recoded to 0/1. Nominal factors i.e. ethnicity and relation, were expanded into binary dummy columns to avoid the false ordinal ordering that integer encoding introduces. Country of residence was excluded: it has over 50 sparse levels that produce many near-zero-variance columns without adding signal. Feature scaling to zero mean and unit variance is applied inside every CV fold and every final model fit, never on the full dataset.
+
+---
+
+# Proposed Methodology
+
+Five classifiers were selected to represent a range of statistical learning approaches, from simple linear models to flexible ensemble methods:
+
+| Model | Rationale |
+|---|---|
+| Logistic Regression | Interpretable linear baseline; directly models log-odds of ASD |
+| LDA | Generative linear model; useful comparator to LR under Gaussian assumptions |
+| Naive Bayes | Tests how far the conditional independence assumption departs from reality |
+| KNN | Non-parametric, distance-based; no linearity assumption, sensitive to scale |
+| Random Forest | Flexible ensemble; captures interactions without manual feature engineering |
+
+Including both linear and non-parametric models makes it possible to determine whether any non-linearity in the data is worth capturing, or whether a simple linear boundary suffices.
+
+**Evaluation pipeline:**
+
+1. Stratified 80/20 train/test split, done once before any modeling
+2. Five-fold CV on the training data used exclusively for model selection and hyperparameter tuning
+3. Final models refit on the full training set using tuned hyperparameters
+4. Evaluated once on the held-out test set
+
+The held-out test set was not consulted at any point during model selection or tuning.
+
+**AUC** served as the primary evaluation metric because it is threshold-independent and appropriate for comparing classifiers across imbalanced classes. **Recall** was treated as a secondary metric because identifying as many true ASD-positive cases as possible is the priority in a screening context.
+
+All preprocessing (including scaling and, where applicable, PCA and near-zero variance filtering) was fit only on the training portion of each cross-validation fold before being applied to the corresponding validation fold, preventing data leakage. LDA specifically required PCA reduction prior to fitting: the dummy-expanded feature matrix produces near-singular within-class covariance matrices on the smaller age-group datasets without it.
+
+---
+
+# Analysis and Results
+
+## Exploratory Data Analysis
+
+### Class Balance
+
+```{r class-balance, fig.cap="Class distribution by age group. The adult dataset is notably more imbalanced, with only about a third of cases being ASD positive.", fig.width=7, fig.height=4, out.width="80%"}
+ggplot(bal, aes(Dataset, pct, fill=ASD)) +
+  geom_col(position="dodge", colour="white", width=.65) +
+  scale_fill_manual(values=c(NO="#d1d5db",YES="#3b82d4"),
+                    labels=c(NO="ASD-",YES="ASD+")) +
+  labs(y="% of group", x=NULL, fill=NULL) +
+  theme_minimal(base_size=11) + theme(legend.position="top")
+```
+
+The adolescent group is approximately `r round(mean(teen$ASD=="YES")*100,0)`% positive while the adult group is only `r round(mean(adult$ASD=="YES")*100,0)`% positive. Stratified cross-validation accounts for this imbalance, but it is the reason raw accuracy is a misleading metric here, and hence, AUC and recall are more appropriate.
+
+### AQ-10 Score Distribution
+
+```{r aq-dist, fig.cap="AQ-10 total score by ASD outcome. ASD-positive cases score consistently higher across all three age groups, with the sharpest separation in the child dataset.", fig.width=11, fig.height=4, out.width="88%"}
+ggplot(aq_long, aes(AQ, fill=ASD)) +
+  geom_histogram(bins=11, position="identity", alpha=.65, colour="white") +
+  facet_wrap(~Dataset, scales="free_y") +
+  scale_fill_manual(values=c(NO="#d1d5db",YES="#3b82d4"),
+                    labels=c(NO="ASD-",YES="ASD+")) +
+  labs(x="AQ Total Score", y="Count", fill=NULL) +
+  theme_minimal(base_size=11) + theme(legend.position="top")
+```
+
+The AQ total score separates ASD-positive from ASD-negative cases well across all three age groups. Most misclassifications are expected to occur in the 4--7 score range, where the two distributions overlap. This pattern suggests that the classes are close to linearly separable, helping explain why logistic regression performs competitively with more complex ensemble methods.
+
+### Correlation Structure
+
+```{r corr-heatmap, fig.cap="Pearson correlation matrix for AQ items, binary demographic variables, and ASD outcome (combined training set). AQ items correlate consistently with the outcome; demographic correlations are weaker.", fig.width=8, fig.height=7, out.width="85%"}
+corrplot(corr_mat, method="color", type="lower", tl.cex=.75,
+         addCoef.col="black", number.cex=.55,
+         col=colorRampPalette(c("#b91c1c","white","#1d4ed8"))(200),
+         mar=c(0,0,1,0))
+```
+
+All ten AQ items are positively correlated with ASD, with A9, A6, A5, and A4 showing the strongest individual associations. The A3--A6 items exhibit moderate inter-item correlation, suggesting related but not redundant questionnaire responses. In contrast, demographic variables (age, gender, jaundice, and family history) show relatively weak correlations with ASD, foreshadowing the chi-square and Random Forest importance analyses presented later.
+
+### Chi-Square Feature Ranking
+
+```{r chi2-plot, fig.cap="Chi-square statistics for each feature against the ASD outcome (combined dataset). AQ items dominate; most demographic variables are not statistically significant.", fig.width=8, fig.height=5, out.width="82%"}
+ggplot(chi2_res %>% arrange(Chi2) %>% mutate(Feature=factor(Feature,levels=Feature)),
+       aes(Feature, Chi2, fill=p<.05)) +
+  geom_col(colour="white") + coord_flip() +
+  scale_fill_manual(values=c("TRUE"="#3b82d4","FALSE"="#d1d5db"),
+                    labels=c("TRUE"="p < .05","FALSE"="n.s.")) +
+  labs(x=NULL, y="Chi-Square Statistic", fill=NULL) +
+  theme_minimal(base_size=11) + theme(legend.position="top")
+```
+
+\Needspace{8\baselineskip}
+
+```{r chi2-table}
+chi2_res %>%
+  mutate(p = ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))) %>%
+  kable(caption="Chi-square test results for features against ASD outcome.",
+        align="lcc", booktabs=TRUE) %>%
+  kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover"),
+                latex_options=c("hold_position"), font_size=8)
+```
+
+Among the demographic variables, family ASD history (`austim`) and jaundice history are statistically significant but exhibit substantially weaker associations than the AQ items, while gender is not significantly associated with ASD (p = `r {gp <- chi2_res %>% filter(Feature=="gender") %>% pull(p); if(gp<0.001) "< 0.001" else round(gp,3)}`). The consistency between the chi-square rankings and the Random Forest variable importance analysis provides independent evidence that the AQ items carry the strongest predictive signal.
+
+### PCA
+
+```{r pca-plot, fig.cap="Scree plot (left) and cumulative variance explained (right) for the combined training set. Variance is spread across many components, with no single dominant direction.", fig.width=11, fig.height=4.5, out.width="88%"}
+gridExtra::grid.arrange(p1, p2, ncol=2)
+```
+
+PCA serves two purposes in this study: as an exploratory tool for understanding the variance structure of the feature space, and as a preprocessing step for LDA during both cross-validation and final model fitting. The first `r which(cum_var>=.9)[1]` principal components explain approximately 90% of the total variance, indicating that the predictive information is distributed across many dimensions rather than concentrated in only a few dominant directions.
+
+## Cross-Validation Results
+
+\Needspace{10\baselineskip}
+
+```{r cv-table}
+cv_tbl  <- cv_res %>% arrange(Group, desc(AUC)) %>%
+  select(Group, Model, AUC, Acc, Rec, Prec, Spec, F1)
+grp_idx <- split(seq_len(nrow(cv_tbl)), cv_tbl$Group)
+grp_ord <- c("Child","Adolescent","Adult","Combined")
+
+tbl <- kable(cv_tbl %>% select(-Group),
+      caption="5-fold cross-validation performance on the training data. Used to select the best model per group; the test set was not consulted.",
+      digits=3, booktabs=TRUE) %>%
+  kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover","condensed"),
+                latex_options=c("hold_position","scale_down"), font_size=8)
+for (g in grp_ord) {
+  if (!is.null(grp_idx[[g]]))
+    tbl <- pack_rows(tbl, g, min(grp_idx[[g]]), max(grp_idx[[g]]))
+}
+tbl
+```
+
+Logistic Regression and Random Forest perform consistently well. Naive Bayes falls behind the others; the moderate inter-item correlations visible in the heatmap suggest the conditional independence assumption is not well satisfied here. The near-perfect combined AUC for logistic regression is examined further in the regularization section.
+
+```{r cv-auc-plot, fig.cap="CV AUC by model and age group. Dashed line marks AUC = 0.90. Logistic Regression and Random Forest are consistently strong across all groups.", fig.width=10, fig.height=5, out.width="88%"}
+ggplot(cv_res, aes(reorder(Model,AUC), AUC, fill=Group)) +
+  geom_col(position="dodge", colour="white", width=.7) + coord_flip() +
+  geom_hline(yintercept=.9, linetype="dashed", colour="firebrick", linewidth=.6) +
+  scale_fill_manual(values=c(Child="#3b82d4",Adolescent="#7c5cd8",
+                              Adult="#57606a",Combined="#1f2328")) +
+  labs(x=NULL, y="AUC", fill="Group") +
+  theme_minimal(base_size=11) + theme(legend.position="right")
+```
+
+## ROC Curves
+
+```{r roc-curves, fig.cap="Pooled 5-fold CV ROC curves on the combined training set. All five classifiers are shown; Logistic Regression, LDA, and RF cluster near the upper-left corner while Naive Bayes lags behind.", fig.width=7, fig.height=6, out.width="75%"}
+roc_cols <- c("#3b82d4","#7c5cd8","#e05c23","#16a34a","#dc2626")
+
+roc_df <- map_dfr(seq_along(roc_list), function(i) {
+  r       <- roc_list[[i]]
+  auc_val <- round(as.numeric(auc(r)), 3)
+  tibble(
+    Model   = paste0(names(roc_list)[i], " (AUC=", auc_val, ")"),
+    FPR     = 1 - r$specificities,
+    TPR     = r$sensitivities,
+    col_idx = i
+  )
+})
+model_levels <- unique(roc_df$Model)
+roc_df$Model <- factor(roc_df$Model, levels=model_levels)
+
+ggplot(roc_df, aes(FPR, TPR, colour=Model, linetype=Model)) +
+  geom_line(linewidth=0.9) +
+  geom_abline(slope=1, intercept=0, linetype="dotted", colour="grey60", linewidth=0.5) +
+  scale_colour_manual(values=setNames(roc_cols[seq_along(roc_list)], model_levels)) +
+  scale_linetype_manual(values=setNames(seq_along(roc_list), model_levels)) +
+  scale_x_continuous(limits=c(0,1), breaks=seq(0,1,0.2), expand=c(0,0)) +
+  scale_y_continuous(limits=c(0,1), breaks=seq(0,1,0.2), expand=c(0,0)) +
+  labs(x="1 - Specificity (FPR)", y="Sensitivity (TPR)",
+       title="ROC - Combined (5-Fold CV)", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=11) +
+  theme(legend.position=c(0.98, 0.02), legend.justification=c(1,0),
+        legend.text=element_text(size=8), legend.key.width=unit(1.4,"cm"),
+        panel.grid.minor=element_blank())
+```
+
+LDA tracks close to LR throughout the curve, consistent with the approximately linear structure of these data. KNN sits between the linear models and Naive Bayes, which has the weakest separation of the five classifiers.
+
+## Hyperparameter Tuning
+
+```{r tuning-plot, fig.cap="KNN CV AUC vs k (left) and RF CV AUC vs mtry (right), shown for the Combined training set. Each age group was tuned independently; these curves are shown for illustration.", fig.width=12, fig.height=4.5, out.width="88%"}
+gridExtra::grid.arrange(pk, pr, ncol=2)
+```
+
+k for KNN and mtry for RF were selected independently within each age group's training data using five-fold CV, so each group's final test-set model uses hyperparameters chosen from its own data. The curves above show the Combined group as a representative example. The search selected k = **`r knn_best_k`** (CV AUC = `r knn_best_auc`) and mtry = **`r rf_best_mtry`** (CV AUC = `r rf_best_auc`) for Combined. The instability at k = 1 is the expected overfitting signature; AUC plateaus at higher k. The RF curve is notably flatter across the mtry range, confirming the exact value matters less than k does for KNN.
+
+## Regularized Logistic Regression
+
+Unregularized LR achieved AUC = `r cv_res %>% filter(Group=="Combined", Model=="Logistic Reg.") %>% pull(AUC)` on the combined training set. That near-perfect result warrants scrutiny as it could reflect genuine near-linear separability, or it could be an artifact of the age-group label being recoverable from the feature space. Elastic-net regularization (sweeping both alpha and lambda) tests whether coefficient shrinkage changes anything.
+
+```{r glmnet-plot, fig.cap="Regularized logistic regression CV AUC along the penalty path (best alpha shown). AUC stays near 1.0 across several orders of magnitude before collapsing at large penalties.", fig.width=8, fig.height=4.5, out.width="80%"}
+ggplot(glmnet_fit$results %>% filter(alpha==glmnet_best$alpha) %>% arrange(lambda),
+       aes(log10(lambda), ROC)) +
+  geom_line(colour="#3b82d4", linewidth=.9) +
+  geom_point(colour="#3b82d4", size=1.8) +
+  geom_vline(xintercept=log10(glmnet_best$lambda), linetype="dashed", colour="firebrick") +
+  labs(title=sprintf("Regularized LR path  [alpha = %.1f, Combined]", glmnet_best$alpha),
+       x="log10(lambda)", y="CV AUC") +
+  theme_minimal(base_size=11)
+```
+
+Best regularized LR: alpha = `r glmnet_best$alpha`, lambda = `r round(glmnet_best$lambda,4)`, CV AUC = **`r glmnet_auc`**. Regularization produced nearly identical performance to the unregularized model. This is consistent with the data being approximately linearly separable, though the screening-only sampling frame means we cannot rule out that the separation is partly a feature of how these data were collected rather than a property that would generalize to broader populations.
+
+## RF Variable Importance
+
+```{r rf-importance, fig.cap="Top 15 features by RF Mean Decrease in Accuracy (combined training set). All ten AQ items rank above every demographic variable.", fig.width=8, fig.height=5, out.width="80%"}
+ggplot(imp_df %>% slice_max(MDA, n=15) %>% arrange(MDA) %>%
+         mutate(Feature=factor(Feature, levels=Feature)),
+       aes(Feature, MDA)) +
+  geom_col(fill="#3b82d4", colour="white") + coord_flip() +
+  labs(x=NULL, y="Mean Decrease in Accuracy") +
+  theme_minimal(base_size=11)
+```
+
+\Needspace{8\baselineskip}
+
+```{r importance-table}
+imp_df %>% head(10) %>%
+  mutate(MDA = round(MDA, 2)) %>%
+  kable(caption="Top 10 features by RF Mean Decrease in Accuracy.", digits=2,
+        booktabs=TRUE) %>%
+  kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover"),
+                latex_options=c("hold_position"), font_size=8)
+```
+
+AQ items dominate the ranking, with A5, A9, A4, and A6 emerging as the most important predictors. This ordering closely mirrors the chi-square results. The consistency between these two independent approaches, one based on univariate association and the other on an ensemble model, strengthens the conclusion that the AQ items carry the strongest predictive signal. Family history (`austim`) and age are the most informative demographic variables, although both contribute substantially less than even the weakest AQ item.
+
+## Full vs AQ-Only Feature Set
+
+If demographic variables contribute limited additional predictive information, a screener relying only on the ten AQ items may be sufficient, simpler, more equitable, and easier to deploy.
+
+```{r feature-compare, fig.cap="CV AUC: full feature set vs. AQ items only (combined dataset). The two feature sets perform nearly identically for most models.", fig.width=9, fig.height=5, out.width="85%"}
+ggplot(comp_comb, aes(reorder(Model,AUC), AUC, fill=FeatSet)) +
+  geom_col(position="dodge", colour="white", width=.65) + coord_flip() +
+  geom_hline(yintercept=.9, linetype="dashed", colour="firebrick", linewidth=.5) +
+  scale_fill_manual(values=c(Full="#3b82d4","AQ-Only"="#d1d5db")) +
+  labs(x=NULL, y="CV AUC", fill=NULL) +
+  theme_minimal(base_size=11) + theme(legend.position="top")
+```
+
+\Needspace{8\baselineskip}
+
+```{r feature-compare-table}
+compare_res %>%
+  filter(Group=="Combined") %>%
+  select(Model, FeatSet, AUC, Acc, Rec, Spec, F1) %>%
+  arrange(Model, FeatSet) %>%
+  kable(caption="Full feature set vs. AQ-only on the combined dataset (5-fold CV).",
+        digits=3, booktabs=TRUE) %>%
+  kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover"),
+                latex_options=c("hold_position","scale_down"), font_size=8)
+```
+
+For most models the AQ-only set matched or came within a few points of the full feature set, and occasionally exceeded it in the adolescent group, where small sample size amplifies noise from high-cardinality nominal columns. From a practical standpoint the ten-item screener appears sufficient.
+
+## Final Test Set Results
+
+Models were refit on the full training split using hyperparameters selected by CV (each group's own best k and mtry), then evaluated exactly once on the held-out 20% test set.
+
+\Needspace{10\baselineskip}
+
+```{r test-results}
+te_tbl  <- test_res %>% arrange(Group, desc(AUC)) %>%
+  select(Group, Model, AUC, Acc, Rec, Prec, F1)
+te_idx  <- split(seq_len(nrow(te_tbl)), te_tbl$Group)
+grp_ord <- c("Child","Adolescent","Adult","Combined")
+
+te_k <- kable(te_tbl %>% select(-Group),
+      caption="Test performance of models selected using cross-validation. Each model was fit on the full training set with tuned hyperparameters and evaluated once on the held-out 20\\% test set.",
+      digits=3, booktabs=TRUE) %>%
+  kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover","condensed"),
+                latex_options=c("hold_position","scale_down"), font_size=8)
+for (g in grp_ord) {
+  if (!is.null(te_idx[[g]]))
+    te_k <- pack_rows(te_k, g, min(te_idx[[g]]), max(te_idx[[g]]))
+}
+te_k
+```
+
+Cross-validation and held-out test performance were broadly consistent, suggesting limited overfitting. Recall is high across all groups, which matters most in a screening setting. The near-perfect AUC values for Logistic Regression and LDA on the combined dataset are plausible: the AQ-10 was designed so that a linear threshold on item scores reliably separates the two classes, and the data were collected from individuals who completed that screener, conditions that naturally favor linear classifiers and can produce ceiling-level discrimination metrics.
+
+---
+
+# Conclusions
+
+**Model Performance.** Logistic Regression and Random Forest achieved nearly identical performance across all age groups and evaluation metrics. The strong performance of logistic regression is consistent with the observed data: the AQ-10 items appear to contribute largely additive information, allowing a relatively simple linear decision boundary to separate the two classes effectively.
+
+**Age-group differences.** Performance is most stable on the adult dataset, which is also the largest. The adolescent group shows more variability between models, attributable largely to the small sample size (n = `r nrow(teen)`) rather than any fundamental difference in the classification problem.
+
+**Feature relevance.** AQ items carry almost all of the predictive signal. The AQ-only models matched the full feature set across all groups, which is both a practical convenience and an equity argument: a screener that relies on behavioral items rather than demographic proxies is less susceptible to demographic bias.
+
+**Regularization.** The near-perfect combined AUC survived elastic-net regularization unchanged, suggesting the result was not driven by unstable coefficient estimates. The conclusion is consistent with approximate linear separability within these datasets, though the screening-only sampling frame is a genuine caveat.
+
+**Limitations.**
+
+- The 80/20 split was performed once; a single split introduces randomness into all point estimates. The adolescent group (n = `r nrow(teen)`) is particularly sensitive to this.
+- All three datasets were collected through the AQ-10 protocol. Individuals never referred for screening are absent, which introduces selection bias. The models should not be assumed to generalize to unscreened populations.
+- No confidence intervals were computed; all conclusions rest on point estimates.
+- The combined dataset includes an age column that may partly serve as a group membership indicator. A robustness check excluding age would be a straightforward follow-up.
+
+**Future directions.** Several extensions would sharpen the conclusions. Bootstrap confidence intervals for AUC would clarify which performance differences are meaningful versus noise. Evaluating sensitivity and specificity at the clinical AQ-10 cutpoint (score >= 6) would connect the model output directly to the standard diagnostic threshold. Repeated random subsampling rather than a single 80/20 split would reduce dependence on the particular split drawn. Excluding age from the combined model explicitly would test whether the near-perfect combined performance holds without that potential confound.
+
+---
+
+# Appendix
+
+## Software
+
+R (v4.3+): `tidyverse`, `caret`, `randomForest`, `e1071`, `MASS`, `glmnet`, `pROC`, `corrplot`, `gridExtra`, `knitr`, `kableExtra`.
+
+## Complete CV Results
+
+```{r full-cv-appendix}
+kable(cv_res %>% arrange(Group, desc(AUC)),
+      caption="Complete 5-fold cross-validation results across all groups and models.",
+      digits=3, booktabs=TRUE) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),
+                latex_options=c("hold_position","repeat_header","scale_down"),
+                full_width=FALSE, font_size=8)
+```
+
+## Full Feature Comparison
+
+```{r full-compare-appendix}
+compare_res %>%
+  arrange(Group, Model, FeatSet) %>%
+  select(Group, Model, FeatSet, AUC, Acc, Rec, Spec, F1) %>%
+  kable(caption="Full feature set vs. AQ-only across all groups (5-fold CV).",
+        digits=3, booktabs=TRUE) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),
+                latex_options=c("hold_position","repeat_header","scale_down"),
+                full_width=FALSE, font_size=8)
+```
+
+---
+
+# Bibliography and Credits
+
+Thabtah, F. (2017). *ASD Screening Datasets*. UCI Machine Learning Repository.
+
+Baron-Cohen, S. et al. (2001). The Autism-Spectrum Quotient (AQ). *Journal of Autism and Developmental Disorders, 31*(1), 5--17.
+
+James, G., Witten, D., Hastie, T., & Tibshirani, R. (2021). *An Introduction to Statistical Learning* (2nd ed.). Springer.
+
+Breiman, L. (2001). Random Forests. *Machine Learning, 45*(1), 5--32.
+
+Kuhn, M. (2008). Building Predictive Models in R Using the caret Package. *Journal of Statistical Software, 28*(5).
+
+---

@@ -1,0 +1,14 @@
+Feature,Chi2,p_value
+A9_Score,388.865,0
+A6_Score,352.049,0
+A5_Score,296.363,0
+A4_Score,282.02,0
+A3_Score,232.959,0
+A10_Score,193.198,0
+A7_Score,131.211,0
+A1_Score,91.578,0
+A2_Score,88.68,0
+A8_Score,82.504,0
+austim,8.93,0.0028
+jundice,6.573,0.01035
+gender,0.745,0.38802
